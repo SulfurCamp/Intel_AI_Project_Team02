@@ -40,11 +40,15 @@ CHAT_HOST = "192.168.0.47"
 CHAT_PORT = 5000
 CHAT_NAME = "RASPBERRYPI"
 
+RS_USE_DEPTH   = True        # 깊이 스트림 켭니다
+RS_ALIGN_DEPTH = True        # 컬러 기준으로 깊이 정렬
+
 # ===== 공유 상태 =====
 latest_frame = None
 frame_lock   = threading.Lock()
 
 latest_result = None
+latest_depth = None
 result_cv = threading.Condition()  # 새 결과 알림
 stop_event = threading.Event()
 
@@ -125,12 +129,7 @@ def send_loop(sock: socket.socket, stop_event: threading.Event, name: str) -> No
             if cur is None or cur == last_sent:
                 continue
 
-            if isinstance(cur, str):
-                payload = f"{cur}@1\n"
-            elif hasattr(cur, "value"):
-                payload = f"{getattr(cur, 'value')}" + "@1\n"
-            else:
-                payload = f"{str(cur)}@1\n"
+            payload = f"{str(cur)}@{str(latest_depth)}\n"
 
             name_msg = payload if payload.startswith('[') else f"[DBCLIENT]{payload}"
 
@@ -187,22 +186,14 @@ def recv_loop(sock: socket.socket, stop_event: threading.Event) -> None:
             pass
 
 def inference_thread():
-    """
-    웹캠(cv2.VideoCapture) → RealSense 파이프라인으로 교체
-    컬러 프레임을 받아 YOLO 추론 및 오버레이, 최신 프레임 공유.
-    """
-    global latest_frame, latest_result
+    global latest_frame, latest_result, latest_depth
 
-    # ----- RealSense 파이프라인 설정 -----  <<<<<<<<<<<<<<<<<<<<<<<<<<<<<< CHANGED
     pipeline = rs.pipeline()
     config   = rs.config()
     if RS_SERIAL:
         config.enable_device(RS_SERIAL)
 
-    # 컬러 스트림
     config.enable_stream(rs.stream.color, WIDTH, HEIGHT, rs.format.bgr8, FPS)
-
-    # (옵션) 깊이 스트림
     if RS_USE_DEPTH:
         config.enable_stream(rs.stream.depth, WIDTH, HEIGHT, rs.format.z16, FPS)
 
@@ -212,7 +203,7 @@ def inference_thread():
     depth_scale = None
     if RS_USE_DEPTH:
         depth_sensor = profile.get_device().first_depth_sensor()
-        depth_scale = depth_sensor.get_depth_scale()  # 미터 환산 (일반적으로 0.001)
+        depth_scale = depth_sensor.get_depth_scale()
 
     model = YOLO(MODEL_PATH)
 
@@ -223,62 +214,57 @@ def inference_thread():
                 frames = align.process(frames)
 
             color_frame = frames.get_color_frame()
+            depth_frame = frames.get_depth_frame() if RS_USE_DEPTH else None
             if not color_frame:
                 time.sleep(0.001)
                 continue
 
-            # numpy 배열로 변환
             frame = np.asanyarray(color_frame.get_data())
-
             h, w = frame.shape[:2]
             cx, cy = w // 2, h // 2
 
-            # YOLO 추론 → 가장 큰 박스 선택
+            # --- YOLO ---
             target_bbox = None
             for r in model(frame, stream=True):
                 target_bbox = select_target(r, WANT_CLASS)
                 if target_bbox is not None:
                     break
 
-            # 오버레이 & 결과 계산
+            # ---- 화면용 오버레이 ----
             tmp = frame.copy()
             draw_grid(tmp)
             draw_cross(tmp)
             with frame_lock:
                 latest_frame = tmp
 
+            # ---- 좌표 결정 (디텍션 없으면 화면 중앙) ----
             if target_bbox is not None:
                 x1, y1, x2, y2 = map(int, target_bbox)
                 bx, by = (x1 + x2)//2, (y1 + y2)//2
+                latest_result = value_from_xy(bx, by, w, h) or "?"
                 cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
                 cv2.circle(frame, (bx,by), 5, (0,0,255), -1)
+            else:
+                bx, by = cx, cy  # 감지 없으면 중앙 픽셀
+                latest_result = None  # 또는 유지하고 싶으면 삭제
 
-                dx  = cx - bx
-                dy  = cy - by
-                ndx = dx / (w/2.0) if w else 0.0
-                ndy = dy / (h/2.0) if h else 0.0
-                val = value_from_xy(bx, by, w, h) or "?"
-
-                latest_result = val
-
-                cv2.putText(frame, f"dx:{dx} dy:{dy} ndx:{ndx:.2f} ndy:{ndy:.2f}",
-                            (max(10, x1), max(30, y1-10)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2, cv2.LINE_AA)
+            # ---- 깊이 읽기 ----
+            if depth_frame is not None:
+                # 좌표 클램프(경계 밖 접근 방지)
+                bx_clamped = int(max(0, min(w-1, bx)))
+                by_clamped = int(max(0, min(h-1, by)))
+                depth_val = depth_frame.get_distance(bx_clamped, by_clamped)  # 미터
+                with frame_lock:
+                    latest_depth = float(depth_val)  # 0.0일 수도 있음(유효치 없는 경우)
 
             with frame_lock:
                 latest_frame = frame
 
             with result_cv:
                 result_cv.notify_all()
-
-    except Exception as e:
-        print(f"[INF] Exception: {e}")
     finally:
-        # ----- RealSense 정리 -----  <<<<<<<<<<<<<<<<<<<<<<<<<<<<<< CHANGED
-        try:
-            pipeline.stop()
-        except Exception:
-            pass
+        try: pipeline.stop()
+        except: pass
         print("[INF] Inference thread exit")
 
 # ===== Flask(MJPEG) 스레드 =====
