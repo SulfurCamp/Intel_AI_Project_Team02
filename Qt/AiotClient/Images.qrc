@@ -1,0 +1,12 @@
+<RCC>
+    <qresource prefix="/Images">
+        <file>Images/background.jpg</file>
+        <file>Images/light_off.png</file>
+        <file>Images/light_on.png</file>
+        <file>Images/plug_off.png</file>
+        <file>Images/plug_on.png</file>
+        <file>Images/room.png</file>
+        <file>Images/room1.png</file>
+        <file>Images/initDisplay.png</file>
+    </qresource>
+</RCC>
