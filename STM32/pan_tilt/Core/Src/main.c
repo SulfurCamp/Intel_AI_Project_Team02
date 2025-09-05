@@ -37,10 +37,6 @@
 #define LEVEL_3_DEGREE 10
 
 #define CMD_BUF_LEN 8
-#define STEPS_PER_REV 2048.0f
-#define STEP_PER_DEG (STEPS_PER_REV / 360.0f)    // ≈5.688888...
-
-
 
 #ifdef __GNUC__
 /* With GCC, small printf (option LD Linker->Libraries->Small printf
