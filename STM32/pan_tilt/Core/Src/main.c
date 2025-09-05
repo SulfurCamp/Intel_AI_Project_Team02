@@ -69,25 +69,10 @@ volatile uint8_t sec_flag = 0;
 char cmd_buf[CMD_BUF_LEN];
 uint8_t rx_ch;
 uint8_t cmd_index = 0;
-volatile uint8_t rx_flag = 0;      // 수신 완료 플래그
+volatile uint8_t rx_flag = 0;
 
-uint8_t current_servo_degree = 0;
-int current_step_degree = 0;    // (stepper → 팬, 0~360도)
-
-// IN1 IN2 IN3 IN4
-const uint8_t step_seq[4][4] = {
-    {1, 0, 0, 1},   // Step 1
-    {1, 1, 0, 0},   // Step 2
-    {0, 1, 1, 0},   // Step 3
-    {0, 0, 1, 1}    // Step 4
-};
-int step_index = 0;
-
-volatile int step_target = 0;
-volatile int step_dir = 0;
-volatile int step_remain = 0;
-volatile uint32_t step_last_tick = 0;
-volatile uint8_t step_busy = 0;
+uint8_t current_servo_degree  = 0; // 틸트: TIM2_CH1 PA0
+uint8_t current_servo2_degree = 90; // 팬  : TIM2_CH2 PA1
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -98,11 +83,10 @@ static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 void set_servo_degree(int degree);
-void set_step_degree(int deg, int dir);
+void set_servo2_degree(int degree);
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
 void parsing_command(char *cmd);
 void control_pantilt(char area, int move_deg);
-void process_step_motor(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -144,8 +128,13 @@ int main(void)
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   HAL_TIM_Base_Start_IT(&htim3);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1); // PA0
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2); // PA1
+
   set_servo_degree(current_servo_degree);
+  set_servo2_degree(current_servo2_degree);
+
   HAL_UART_Receive_IT(&huart2, &rx_ch, 1);
   /* USER CODE END 2 */
 
@@ -153,7 +142,6 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  process_step_motor();
 	if (rx_flag) {
 		parsing_command(cmd_buf);    // 수신 명령 처리
 		rx_flag = 0;
@@ -250,6 +238,10 @@ static void MX_TIM2_Init(void)
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
   }
@@ -404,42 +396,22 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void set_servo_degree(int degree)
 {
     if (degree < 0) degree = 0;
-    if (degree > 180) degree = 180;
+    if (degree > 90) degree = 90;
     uint16_t pulse = 500 + ((uint16_t)degree * 2000) / 180;
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pulse);
     current_servo_degree = degree;
 }
 
-void set_step_degree(int deg, int dir)
+void set_servo2_degree(int degree)
 {
-    int steps = (int)(deg * STEP_PER_DEG + 0.5f);
-    step_target = steps;
-    step_dir = dir;
-    step_remain = steps;
-    step_last_tick = tick_1ms;
-    step_busy = 1;
+    if (degree < 0)   degree = 0;
+    if (degree > 180) degree = 180;
+    uint16_t pulse = 500 + ((uint16_t)degree * 2000) / 180; // 0°=0.5ms, 180°=2.5ms
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, pulse);
+    current_servo2_degree = degree;
 }
 
-// (deg: 각도, dir: 0=좌, 1=우)
-void process_step_motor(void)
-{
-    if (!step_busy || step_remain <= 0) return;
-    if ((tick_1ms - step_last_tick) >= 3) { // 30ms 마다
-        if (step_dir) step_index = (step_index + 1) % 4;
-        else          step_index = (step_index + 3) % 4;
 
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, step_seq[step_index][0]);
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, step_seq[step_index][1]);
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, step_seq[step_index][2]);
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_11, step_seq[step_index][3]);
-
-        step_remain--;
-        step_last_tick = tick_1ms;
-        if (step_remain <= 0) {
-            step_busy = 0;
-        }
-    }
-}
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
@@ -457,6 +429,12 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
 void parsing_command(char *recvBuf)
 {
+    if (recvBuf[0] == 'R' && recvBuf[1] == '\0') {
+        set_servo_degree(0);
+        set_servo2_degree(90);
+        return;
+    }
+
     int i = 0;
     char *pToken;
     char *pArray[2] = { 0 };
@@ -502,57 +480,40 @@ void control_pantilt(char area, int move_deg)
 {
     switch(area) {
         case 'Q': // 좌상
-            if (current_servo_degree + move_deg <= 180)
-                set_servo_degree(current_servo_degree + move_deg);
-            else
-                set_servo_degree(180);
-            set_step_degree(move_deg, 0); // 좌
+            set_servo_degree( (current_servo_degree + move_deg > 180) ? 180 : current_servo_degree + move_deg );
+            set_servo2_degree( (current_servo2_degree >= move_deg) ? current_servo2_degree - move_deg : 0 );
             break;
         case 'W': // 상
-            if (current_servo_degree + move_deg <= 180)
-                set_servo_degree(current_servo_degree + move_deg);
-            else
-                set_servo_degree(180);
+            set_servo_degree( (current_servo_degree + move_deg > 180) ? 180 : current_servo_degree + move_deg );
             break;
         case 'E': // 우상
-            if (current_servo_degree + move_deg <= 180)
-                set_servo_degree(current_servo_degree + move_deg);
-            else
-                set_servo_degree(180);
-            set_step_degree(move_deg, 1); // 우
+            set_servo_degree( (current_servo_degree + move_deg > 180) ? 180 : current_servo_degree + move_deg );
+            set_servo2_degree( (current_servo2_degree + move_deg > 180) ? 180 : current_servo2_degree + move_deg );
             break;
         case 'A': // 좌
-        	set_step_degree(move_deg, 0); // 좌
+            set_servo2_degree( (current_servo2_degree >= move_deg) ? current_servo2_degree - move_deg : 0 );
             break;
-        case 'S': // 중앙(정지)
+        case 'S': // 정지
             break;
         case 'D': // 우
-        	set_step_degree(move_deg, 1); // 우
+            set_servo2_degree( (current_servo2_degree + move_deg > 180) ? 180 : current_servo2_degree + move_deg );
             break;
         case 'Z': // 좌하
-            if (current_servo_degree - move_deg >= 0)
-                set_servo_degree(current_servo_degree - move_deg);
-            else
-                set_servo_degree(0);
-            set_step_degree(move_deg, 0); // 좌
+            set_servo_degree( (current_servo_degree >= move_deg) ? current_servo_degree - move_deg : 0 );
+            set_servo2_degree( (current_servo2_degree >= move_deg) ? current_servo2_degree - move_deg : 0 );
             break;
         case 'X': // 하
-            if (current_servo_degree - move_deg >= 0)
-                set_servo_degree(current_servo_degree - move_deg);
-            else
-                set_servo_degree(0);
+            set_servo_degree( (current_servo_degree >= move_deg) ? current_servo_degree - move_deg : 0 );
             break;
         case 'C': // 우하
-            if (current_servo_degree - move_deg >= 0)
-                set_servo_degree(current_servo_degree - move_deg);
-            else
-                set_servo_degree(0);
-            set_step_degree(move_deg, 1); // 우
+            set_servo_degree( (current_servo_degree >= move_deg) ? current_servo_degree - move_deg : 0 );
+            set_servo2_degree( (current_servo2_degree + move_deg > 180) ? 180 : current_servo2_degree + move_deg );
             break;
         default:
             break;
     }
 }
+
 
 
 /**
