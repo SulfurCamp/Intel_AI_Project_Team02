@@ -60,8 +60,8 @@ all: main-build
 main-build: pan_tilt.elf secondary-outputs
 
 # Tool invocations
-pan_tilt.elf pan_tilt.map: $(OBJS) $(USER_OBJS) C:\Users\STC\jeong_ws\stm32\pan_tilt\STM32F411RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "pan_tilt.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\STC\jeong_ws\stm32\pan_tilt\STM32F411RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="pan_tilt.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+pan_tilt.elf pan_tilt.map: $(OBJS) $(USER_OBJS) /home/ubuntu/jeong_ws/Intel_AI_Project_Team02/STM32/pan_tilt/STM32F411RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "pan_tilt.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"/home/ubuntu/jeong_ws/Intel_AI_Project_Team02/STM32/pan_tilt/STM32F411RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="pan_tilt.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
