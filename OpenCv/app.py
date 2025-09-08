@@ -24,8 +24,8 @@ RS_USE_DEPTH   = False       # True 로 바꾸면 깊이 스트림도 켭니다
 RS_ALIGN_DEPTH = False       # True 로 바꾸면 컬러에 깊이를 정렬합니다
 RS_SERIAL      = None        # 특정 장치 지정 시 시리얼 문자열
 
-SERIAL_PORT = "/dev/ttyUSB0" # Windows 예: "COM6"
-SERIAL_BAUD = 115200
+SERIAL_PORT = "/dev/ttyACM0"
+BAUDRATE = 115200
 SERIAL_TIMEOUT = 0.05
 UART_RATE_HZ = 20
 
@@ -51,6 +51,8 @@ latest_result = None
 latest_depth = None
 result_cv = threading.Condition()  # 새 결과 알림
 stop_event = threading.Event()
+
+sec = 1.0
 
 # ===== 3x3 키맵 & 좌표→문자 =====
 KEYMAP = [
@@ -107,37 +109,37 @@ def select_target(result, want_cls=None):
     if best_i < 0: return None
     return tuple(map(float, xyxy[best_i]))
 
-def send_loop(sock: socket.socket, stop_event: threading.Event, name: str) -> None:
+def send_loop(sock: socket.socket, stop_event: threading.Event, name: str, interval: float = sec) -> None:
     """
     latest_result가 변경될 때만 서버로 전송.
     메시지가 '[' 로 시작하지 않으면 [ALLMSG] prefix를 붙여 보냄.
     """
     print("Send loop: only on latest_result changes")
-    last_sent = None
+    next_ts = time.monotonic()
 
     try:
         while not stop_event.is_set():
-            with result_cv:
-                result_cv.wait_for(
-                    lambda: stop_event.is_set() or (latest_result is not None and latest_result != last_sent),
-                    timeout=1.0
-                )
-                cur = latest_result
+            # 최신 값 스냅샷
+            cur   = latest_result
+            depth = latest_depth
 
-            if stop_event.is_set():
-                break
-            if cur is None or cur == last_sent:
-                continue
+            if cur is not None:  # 값이 있을 때만 보냄(원하면 이 조건을 제거해 항상 전송)
+                if depth == 0 :
+                    payload  = f"{str(cur)}@1\n"
+                else :
+                    payload  = f"{str(cur)}@2\n"
+                
+                name_msg = payload if payload.startswith('[') else f"[QTCLIENT]{payload}"
+                try:
+                    sock.sendall(name_msg.encode("utf-8"))
+                except OSError:
+                    stop_event.set()
+                    break
 
-            payload = f"{str(cur)}@{str(latest_depth)}\n"
-
-            name_msg = payload if payload.startswith('[') else f"[DBCLIENT]{payload}"
-
-            try:
-                sock.sendall(name_msg.encode("utf-8"))
-                last_sent = cur
-            except OSError:
-                stop_event.set()
+            # 정확한 주기 유지(드리프트 방지)
+            next_ts += interval
+            sleep_for = max(0.0, next_ts - time.monotonic())
+            if stop_event.wait(sleep_for):
                 break
     finally:
         try:
@@ -148,7 +150,6 @@ def send_loop(sock: socket.socket, stop_event: threading.Event, name: str) -> No
             sock.close()
         except OSError:
             pass
-
 
 def recv_loop(sock: socket.socket, stop_event: threading.Event) -> None:
     """
@@ -302,47 +303,45 @@ def flask_thread():
     app.run(host=HOST, port=PORT, threaded=True, use_reloader=False)
 
 # ===== UART 스레드 =====
-def uart_thread():
+def uart_thread(interval=None):
     ser = None
     period = 1.0 / max(1, UART_RATE_HZ)
+
     while not stop_event.is_set():
         # 연결 없으면 재시도
         if ser is None:
             try:
-                ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=SERIAL_TIMEOUT)
-                print(f"[UART] Opened {SERIAL_PORT} @ {SERIAL_BAUD}")
+                ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=SERIAL_TIMEOUT)
+                print(f"[UART] Opened {SERIAL_PORT} @ {BAUDRATE}")
             except Exception as e:
                 print(f"[UART] Open failed: {e}; retry in 1s")
                 time.sleep(1.0)
                 continue
 
-        # 새 결과가 오길 기다림(또는 타임아웃 주기 전송)
-        with result_cv:
-            result_cv.wait(timeout=period)
-            res = latest_result
+        # 최신 값 스냅샷
+        cur   = latest_result
+        depth = latest_depth
 
-        if res is None:
-            continue
+        if cur is not None:
+            payload = f"{str(cur)}@1\n" if depth == 0 else f"{str(cur)}@2\n"
+            try:
+                ser.write(payload.encode("ascii"))
+                print(f"[UART] Sent: {payload.strip()}")
+            except Exception as e:
+                print(f"[UART] Write failed: {e}; reopening...")
+                try: ser.close()
+                except: pass
+                ser = None
 
-        # NOTE: 기존 코드가 res를 객체로 가정합니다. 현재 latest_result는 문자열(예: 'Q')이므로
-        # 아래 라인은 필요시 프로토콜에 맞게 바꾸세요.
-        # line = f"VAL:{res.value},dx:{res.dx},dy:{res.dy},ndx:{res.ndx:.3f},ndy:{res.ndy:.3f}\n"
-        line = f"VAL:{res}\n"
-        try:
-            ser.write(line.encode("ascii"))
-        except Exception as e:
-            print(f"[UART] Write failed: {e}; reopening...")
-            try: ser.close()
-            except: pass
-            ser = None
+        time.sleep(period)
 
-    # 종료 정리
     try:
         if ser and ser.is_open:
             ser.close()
     except:
         pass
     print("[UART] Thread exit")
+
 
 # ===== 소켓 클라이언트 스레드 (추가) =====
 def socket_client_thread():
@@ -386,7 +385,7 @@ def socket_client_thread():
 # ===== 실행 =====
 if __name__ == "__main__":
     th_inf  = threading.Thread(target=inference_thread, name="infer", daemon=True)
-    th_uart = threading.Thread(target=uart_thread,    name="uart",  daemon=True)
+    th_uart = threading.Thread(target=uart_thread, name="uart", kwargs={"interval": sec} , daemon=True)
     th_sock = threading.Thread(target=socket_client_thread, name="sock", daemon=True)
 
     th_inf.start()
