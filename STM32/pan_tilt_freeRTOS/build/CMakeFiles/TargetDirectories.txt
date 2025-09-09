@@ -1,0 +1,7 @@
+/home/ubuntu/jeong_ws/Intel_AI_Project_Team02/STM32/pan_tilt_freeRTOS/build/CMakeFiles/pan_tilt_freeRTOS.dir
+/home/ubuntu/jeong_ws/Intel_AI_Project_Team02/STM32/pan_tilt_freeRTOS/build/CMakeFiles/edit_cache.dir
+/home/ubuntu/jeong_ws/Intel_AI_Project_Team02/STM32/pan_tilt_freeRTOS/build/CMakeFiles/rebuild_cache.dir
+/home/ubuntu/jeong_ws/Intel_AI_Project_Team02/STM32/pan_tilt_freeRTOS/build/cmake/stm32cubemx/CMakeFiles/STM32_Drivers.dir
+/home/ubuntu/jeong_ws/Intel_AI_Project_Team02/STM32/pan_tilt_freeRTOS/build/cmake/stm32cubemx/CMakeFiles/FreeRTOS.dir
+/home/ubuntu/jeong_ws/Intel_AI_Project_Team02/STM32/pan_tilt_freeRTOS/build/cmake/stm32cubemx/CMakeFiles/edit_cache.dir
+/home/ubuntu/jeong_ws/Intel_AI_Project_Team02/STM32/pan_tilt_freeRTOS/build/cmake/stm32cubemx/CMakeFiles/rebuild_cache.dir
