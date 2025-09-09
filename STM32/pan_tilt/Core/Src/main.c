@@ -15,7 +15,6 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdio.h>
 #include <string.h>
 /* USER CODE END Includes */
 
@@ -31,12 +30,6 @@
 
 #define CMD_BUF_LEN 64
 #define RX_BUF_LEN 128
-
-#ifdef __GNUC__
-#define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
-#else
-#define PUTCHAR_PROTOTYPE int fputc(int ch, FILE *f)
-#endif
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -130,7 +123,6 @@ int main(void)
 
   /* DMA + IDLE 수신 시작 */
   HAL_UARTEx_ReceiveToIdle_DMA(&huart2, rx_dma_buf, RX_BUF_LEN);
-  __HAL_DMA_DISABLE_IT(&hdma_usart2_rx, DMA_IT_HT); // 선택: Half-transfer 알림 불필요
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -400,45 +392,37 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 /* DMA+IDLE 수신 콜백 */
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
-  if (huart->Instance != USART2)
-  {
-    HAL_UARTEx_ReceiveToIdle_DMA(huart, rx_dma_buf, RX_BUF_LEN);
-    return;
-  }
-
-  for (uint16_t i = 0; i < Size; i++)
-  {
-    uint8_t ch = rx_dma_buf[i];
-    if (ch == '\r')
-      continue;
-    if (ch == '\n')
-    {
-      line_accum[line_len] = 0;
-      if (line_len)
-        parsing_command(line_accum);
-      line_len = 0;
+    if (huart->Instance != USART2) {
+        HAL_UARTEx_ReceiveToIdle_DMA(huart, rx_dma_buf, RX_BUF_LEN);
+        __HAL_DMA_DISABLE_IT(&hdma_usart2_rx, DMA_IT_HT); // 선택
+        return;
     }
-    else if (line_len < CMD_BUF_LEN - 1)
-      line_accum[line_len++] = (char)ch;
-    else
-      line_len = 0;
-  }
 
-  HAL_UARTEx_ReceiveToIdle_DMA(&huart2, rx_dma_buf, RX_BUF_LEN);
-}
+    for (uint16_t i = 0; i < Size; i++) {
+        uint8_t ch = rx_dma_buf[i];
+        if (ch == '\r') continue;
+        if (ch == '\n') {
+            line_accum[line_len] = 0;
+            if (line_len) parsing_command(line_accum);
+            line_len = 0;
+        } else if (line_len < CMD_BUF_LEN - 1) {
+            line_accum[line_len++] = (char)ch;
+        } else {
+            line_len = 0;  // 오버플로우 시 라인 리셋
+        }
+    }
 
-restart_rx :
-    /* 연속 수신 재개 필수 */
+    // 연속 수신 재가동
     HAL_UARTEx_ReceiveToIdle_DMA(&huart2, rx_dma_buf, RX_BUF_LEN);
-__HAL_DMA_DISABLE_IT(&hdma_usart2_rx, DMA_IT_HT);
 }
+
 
 void set_servo_degree(int degree)
 {
   if (degree < 0)
     degree = 0;
-  if (degree > 180)
-    degree = 180;
+  if (degree > 90)
+    degree = 90;
   uint16_t pulse = 500 + ((uint16_t)degree * 2000) / 180; // 0.5~2.5ms
   __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pulse);
   current_servo_degree = degree;
@@ -482,7 +466,6 @@ void parsing_command(char *recvBuf)
 
   if (i < 2 || !pArray[0] || !pArray[1])
   {
-    printf("Parsing error\r\n");
     return;
   }
 
@@ -495,7 +478,6 @@ void parsing_command(char *recvBuf)
   }
   else
   {
-    printf("Parsing error: level token invalid (%s)\r\n", pArray[1]);
     return;
   }
 
@@ -544,11 +526,6 @@ void control_pantilt(char area, int move_deg)
   }
 }
 
-PUTCHAR_PROTOTYPE
-{
-  HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, 0xFFFF);
-  return ch;
-}
 /* USER CODE END 4 */
 
 /**
