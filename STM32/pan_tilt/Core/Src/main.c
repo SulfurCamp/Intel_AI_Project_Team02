@@ -2,17 +2,11 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : UART2 RX via DMA + IDLE interrupt
   ******************************************************************************
   * @attention
-  *
   * Copyright (c) 2025 STMicroelectronics.
   * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -27,7 +21,6 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -36,20 +29,18 @@
 #define LEVEL_2_DEGREE 20
 #define LEVEL_3_DEGREE 10
 
-#define CMD_BUF_LEN 8
+#define CMD_BUF_LEN  64
+#define RX_BUF_LEN   128
 
 #ifdef __GNUC__
-/* With GCC, small printf (option LD Linker->Libraries->Small printf
-   set to 'Yes') calls __io_putchar() */
 #define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
 #else
 #define PUTCHAR_PROTOTYPE int fputc(int ch, FILE *f)
-#endif /* __GNUC__ */
+#endif
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -57,37 +48,38 @@ TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 
 UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart2_rx;
 
 /* USER CODE BEGIN PV */
 volatile uint32_t tick_1ms = 0;
-volatile uint8_t sec_flag = 0;
+volatile uint8_t  sec_flag = 0;
 
-char cmd_buf[CMD_BUF_LEN];
-uint8_t rx_ch;
-uint8_t cmd_index = 0;
-volatile uint8_t rx_flag = 0;
+/* DMA 수신 버퍼 및 라인 누적 */
+uint8_t  rx_dma_buf[RX_BUF_LEN];
+char     line_accum[CMD_BUF_LEN];
+uint16_t line_len = 0;
 
-uint8_t current_servo_degree  = 0; // 틸트: TIM2_CH1 PA0
-uint8_t current_servo2_degree = 90; // 팬  : TIM2_CH2 PA1
+/* 팬/틸트 각도 상태 */
+uint8_t current_servo_degree  = 0;   // TIM2_CH1
+uint8_t current_servo2_degree = 90;  // TIM2_CH2
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 void set_servo_degree(int degree);
 void set_servo2_degree(int degree);
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
 void parsing_command(char *cmd);
 void control_pantilt(char area, int move_deg);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
 /* USER CODE END 0 */
 
 /**
@@ -119,29 +111,32 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  HAL_TIM_Base_Start_IT(&htim3);
+  /* NVIC: USART2 IDLE IRQ 활성 (필수) */
+  HAL_NVIC_SetPriority(USART2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(USART2_IRQn);
 
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1); // PA0
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2); // PA1
+  /* 타이머, PWM 시작 */
+  HAL_TIM_Base_Start_IT(&htim3);
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
 
   set_servo_degree(current_servo_degree);
   set_servo2_degree(current_servo2_degree);
 
-  HAL_UART_Receive_IT(&huart2, &rx_ch, 1);
+  /* DMA + IDLE 수신 시작 */
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart2, rx_dma_buf, RX_BUF_LEN);
+  __HAL_DMA_DISABLE_IT(&hdma_usart2_rx, DMA_IT_HT);  // 선택: Half-transfer 알림 불필요
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	if (rx_flag) {
-		parsing_command(cmd_buf);    // 수신 명령 처리
-		rx_flag = 0;
-	}
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -330,6 +325,22 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -381,148 +392,141 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-    if (htim->Instance == TIM3) {
-        tick_1ms++; // 10ms 단위
-        if (tick_1ms % 1000 == 0) { // 1초(=100*10ms)마다
-            sec_flag = 1;
-        }
+  if (htim->Instance == TIM3) {
+    tick_1ms++;
+    if ((tick_1ms % 1000) == 0) { sec_flag = 1; }
+  }
+}
+
+/* DMA+IDLE 수신 콜백 */
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+  if (huart->Instance != USART2) goto restart_rx;
+
+  for (uint16_t i = 0; i < Size; i++) {
+    uint8_t ch = rx_dma_buf[i];
+    if (ch == '\r') continue;
+    if (ch == '\n') {
+      line_accum[line_len] = '\0';
+      if (line_len > 0) parsing_command(line_accum);
+      line_len = 0;
+    } else {
+      if (line_len < (CMD_BUF_LEN - 1)) {
+        line_accum[line_len++] = (char)ch;
+      } else {
+        line_len = 0;  // 오버플로 시 라인 리셋
+      }
     }
+  }
+
+restart_rx:
+  /* 연속 수신 재개 필수 */
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart2, rx_dma_buf, RX_BUF_LEN);
+  __HAL_DMA_DISABLE_IT(&hdma_usart2_rx, DMA_IT_HT);
 }
 
 void set_servo_degree(int degree)
 {
-    if (degree < 0) degree = 0;
-    if (degree > 90) degree = 90;
-    uint16_t pulse = 500 + ((uint16_t)degree * 2000) / 180;
-    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pulse);
-    current_servo_degree = degree;
+  if (degree < 0)   degree = 0;
+  if (degree > 180) degree = 180;
+  uint16_t pulse = 500 + ((uint16_t)degree * 2000) / 180; // 0.5~2.5ms
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pulse);
+  current_servo_degree = degree;
 }
 
 void set_servo2_degree(int degree)
 {
-    if (degree < 0)   degree = 0;
-    if (degree > 180) degree = 180;
-    uint16_t pulse = 500 + ((uint16_t)degree * 2000) / 180; // 0°=0.5ms, 180°=2.5ms
-    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, pulse);
-    current_servo2_degree = degree;
-}
-
-
-
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == USART2) {
-        if (rx_ch == '\n' || cmd_index >= CMD_BUF_LEN - 1) {
-            cmd_buf[cmd_index] = 0;
-            rx_flag = 1;              // 플래그만 세팅
-            cmd_index = 0;
-        } else {
-            cmd_buf[cmd_index++] = rx_ch;
-        }
-        HAL_UART_Receive_IT(&huart2, &rx_ch, 1); // 재수신
-    }
+  if (degree < 0)   degree = 0;
+  if (degree > 180) degree = 180;
+  uint16_t pulse = 500 + ((uint16_t)degree * 2000) / 180;
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, pulse);
+  current_servo2_degree = degree;
 }
 
 void parsing_command(char *recvBuf)
 {
-    if (recvBuf[0] == 'R' && recvBuf[1] == '\0') {
-        set_servo_degree(0);
-        set_servo2_degree(90);
-        return;
-    }
+  if (recvBuf[0] == 'R' && recvBuf[1] == '\0') {
+    set_servo_degree(0);
+    set_servo2_degree(90);
+    return;
+  }
 
-    int i = 0;
-    char *pToken;
-    char *pArray[2] = { 0 };
+  int i = 0;
+  char *pToken;
+  char *pArray[2] = {0};
 
-    if (recvBuf[strlen(recvBuf) - 1] == '\n')
-        recvBuf[strlen(recvBuf) - 1] = '\0';
+  if (recvBuf[strlen(recvBuf) - 1] == '\n')
+    recvBuf[strlen(recvBuf) - 1] = '\0';
 
-    pToken = strtok(recvBuf, "@");
-    while (pToken != NULL) {
-        pArray[i] = pToken;
-        if (++i >= 2) break;
-        pToken = strtok(NULL, "@");
-    }
+  pToken = strtok(recvBuf, "@");
+  while (pToken != NULL) {
+    pArray[i] = pToken;
+    if (++i >= 2) break;
+    pToken = strtok(NULL, "@");
+  }
 
-    if (i < 2) {
-        printf("Parsing error: too few tokens (%d)\r\n", i);
-        return;
-    }
-    if (pArray[0] == NULL || pArray[1] == NULL) {
-        printf("Parsing error: NULL token(s)\r\n");
-        return;
-    }
+  if (i < 2 || !pArray[0] || !pArray[1]) {
+    printf("Parsing error\r\n");
+    return;
+  }
 
-    char area = pArray[0][0];
-    int level = 1;
+  char area = pArray[0][0];
+  int level = 1;
 
-    if (strlen(pArray[1]) == 1 && pArray[1][0] >= '1' && pArray[1][0] <= '3') {
-        level = pArray[1][0] - '0';
-    } else {
-        printf("Parsing error: level token invalid (%s)\r\n", pArray[1]);
-        return;
-    }
+  if (strlen(pArray[1]) == 1 && pArray[1][0] >= '1' && pArray[1][0] <= '3') {
+    level = pArray[1][0] - '0';
+  } else {
+    printf("Parsing error: level token invalid (%s)\r\n", pArray[1]);
+    return;
+  }
 
-    int move_deg = 0;
-    if (level == 1) move_deg = LEVEL_1_DEGREE;
-    else if (level == 2) move_deg = LEVEL_2_DEGREE;
-    else if (level == 3) move_deg = LEVEL_3_DEGREE;
+  int move_deg = (level == 1) ? LEVEL_1_DEGREE :
+                 (level == 2) ? LEVEL_2_DEGREE : LEVEL_3_DEGREE;
 
-    control_pantilt(area, move_deg);
+  control_pantilt(area, move_deg);
 }
 
 void control_pantilt(char area, int move_deg)
 {
-    switch(area) {
-        case 'Q': // 좌상
-            set_servo_degree( (current_servo_degree + move_deg > 180) ? 180 : current_servo_degree + move_deg );
-            set_servo2_degree( (current_servo2_degree >= move_deg) ? current_servo2_degree - move_deg : 0 );
-            break;
-        case 'W': // 상
-            set_servo_degree( (current_servo_degree + move_deg > 180) ? 180 : current_servo_degree + move_deg );
-            break;
-        case 'E': // 우상
-            set_servo_degree( (current_servo_degree + move_deg > 180) ? 180 : current_servo_degree + move_deg );
-            set_servo2_degree( (current_servo2_degree + move_deg > 180) ? 180 : current_servo2_degree + move_deg );
-            break;
-        case 'A': // 좌
-            set_servo2_degree( (current_servo2_degree >= move_deg) ? current_servo2_degree - move_deg : 0 );
-            break;
-        case 'S': // 정지
-            break;
-        case 'D': // 우
-            set_servo2_degree( (current_servo2_degree + move_deg > 180) ? 180 : current_servo2_degree + move_deg );
-            break;
-        case 'Z': // 좌하
-            set_servo_degree( (current_servo_degree >= move_deg) ? current_servo_degree - move_deg : 0 );
-            set_servo2_degree( (current_servo2_degree >= move_deg) ? current_servo2_degree - move_deg : 0 );
-            break;
-        case 'X': // 하
-            set_servo_degree( (current_servo_degree >= move_deg) ? current_servo_degree - move_deg : 0 );
-            break;
-        case 'C': // 우하
-            set_servo_degree( (current_servo_degree >= move_deg) ? current_servo_degree - move_deg : 0 );
-            set_servo2_degree( (current_servo2_degree + move_deg > 180) ? 180 : current_servo2_degree + move_deg );
-            break;
-        default:
-            break;
-    }
+  switch(area) {
+    case 'Q':
+      set_servo_degree( (current_servo_degree + move_deg > 180) ? 180 : current_servo_degree + move_deg );
+      set_servo2_degree( (current_servo2_degree >= move_deg) ? current_servo2_degree - move_deg : 0 );
+      break;
+    case 'W':
+      set_servo_degree( (current_servo_degree + move_deg > 180) ? 180 : current_servo_degree + move_deg );
+      break;
+    case 'E':
+      set_servo_degree( (current_servo_degree + move_deg > 180) ? 180 : current_servo_degree + move_deg );
+      set_servo2_degree( (current_servo2_degree + move_deg > 180) ? 180 : current_servo2_degree + move_deg );
+      break;
+    case 'A':
+      set_servo2_degree( (current_servo2_degree >= move_deg) ? current_servo2_degree - move_deg : 0 );
+      break;
+    case 'S':
+      break;
+    case 'D':
+      set_servo2_degree( (current_servo2_degree + move_deg > 180) ? 180 : current_servo2_degree + move_deg );
+      break;
+    case 'Z':
+      set_servo_degree( (current_servo_degree >= move_deg) ? current_servo_degree - move_deg : 0 );
+      set_servo2_degree( (current_servo2_degree >= move_deg) ? current_servo2_degree - move_deg : 0 );
+      break;
+    case 'X':
+      set_servo_degree( (current_servo_degree >= move_deg) ? current_servo_degree - move_deg : 0 );
+      break;
+    case 'C':
+      set_servo_degree( (current_servo_degree >= move_deg) ? current_servo_degree - move_deg : 0 );
+      set_servo2_degree( (current_servo2_degree + move_deg > 180) ? 180 : current_servo2_degree + move_deg );
+      break;
+    default:
+      break;
+  }
 }
 
-
-
-/**
-  * @brief  Retargets the C library printf function to the USART.
-  * @param  None
-  * @retval None
-  */
 PUTCHAR_PROTOTYPE
 {
-  /* Place your implementation of fputc here */
-  /* e.g. write a character to the USART6 and Loop until the end of transmission */
   HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, 0xFFFF);
-
   return ch;
 }
 /* USER CODE END 4 */
