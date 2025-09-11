@@ -24,9 +24,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define LEVEL_1_DEGREE 30
-#define LEVEL_2_DEGREE 20
-#define LEVEL_3_DEGREE 10
+#define LEVEL_1_DEGREE 5
+#define LEVEL_2_DEGREE 4
+#define LEVEL_3_DEGREE 3
+#define LEVEL_4_DEGREE 2
+#define LEVEL_5_DEGREE 1
 
 #define CMD_BUF_LEN 64
 #define RX_BUF_LEN 128
@@ -44,8 +46,15 @@ UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_usart2_rx;
 
 /* USER CODE BEGIN PV */
+volatile uint32_t last_uart_tick = 0;
+uint8_t timeout_reset_flag = 0;
+
+volatile uint8_t uart_flag = 0; // ISR에서 완성된 라인 존재 여부
+char uart_buf[CMD_BUF_LEN];     // ISR에서 복사해서 메인에서 파싱할 버퍼
+
 volatile uint32_t tick_1ms = 0;
 volatile uint8_t sec_flag = 0;
+volatile uint8_t sec3_flag = 0;
 
 /* DMA 수신 버퍼 및 라인 누적 */
 uint8_t rx_dma_buf[RX_BUF_LEN];
@@ -69,6 +78,7 @@ void set_servo_degree(int degree);
 void set_servo2_degree(int degree);
 void parsing_command(char *cmd);
 void control_pantilt(char area, int move_deg);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -118,8 +128,8 @@ int main(void)
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
 
-  set_servo_degree(current_servo_degree);
-  set_servo2_degree(current_servo2_degree);
+  set_servo_degree(0);
+  set_servo2_degree(90);
 
   /* DMA + IDLE 수신 시작 */
   HAL_UARTEx_ReceiveToIdle_DMA(&huart2, rx_dma_buf, RX_BUF_LEN);
@@ -129,6 +139,19 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    if (uart_flag)
+    {
+      uart_flag = 0;
+      parsing_command(uart_buf);
+    }
+
+    if ((tick_1ms - last_uart_tick) > 2000 && timeout_reset_flag == 0)
+    {
+      set_servo_degree(0);
+      set_servo2_degree(90);
+      timeout_reset_flag = 1;
+    }
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -377,45 +400,62 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/* 타이머 콜백(그대로) */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM3)
   {
     tick_1ms++;
     if ((tick_1ms % 1000) == 0)
-    {
       sec_flag = 1;
-    }
+    if ((tick_1ms % 3000) == 0)
+      sec3_flag = 1;
   }
 }
 
 /* DMA+IDLE 수신 콜백 */
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
-    if (huart->Instance != USART2) {
-        HAL_UARTEx_ReceiveToIdle_DMA(huart, rx_dma_buf, RX_BUF_LEN);
-        __HAL_DMA_DISABLE_IT(&hdma_usart2_rx, DMA_IT_HT); // 선택
-        return;
-    }
+  if (huart->Instance != USART2)
+  {
+    HAL_UARTEx_ReceiveToIdle_DMA(huart, rx_dma_buf, RX_BUF_LEN);
+    __HAL_DMA_DISABLE_IT(&hdma_usart2_rx, DMA_IT_HT); // 선택
+    return;
+  }
 
-    for (uint16_t i = 0; i < Size; i++) {
-        uint8_t ch = rx_dma_buf[i];
-        if (ch == '\r') continue;
-        if (ch == '\n') {
-            line_accum[line_len] = 0;
-            if (line_len) parsing_command(line_accum);
-            line_len = 0;
-        } else if (line_len < CMD_BUF_LEN - 1) {
-            line_accum[line_len++] = (char)ch;
-        } else {
-            line_len = 0;  // 오버플로우 시 라인 리셋
+  for (uint16_t i = 0; i < Size; i++)
+  {
+    uint8_t ch = rx_dma_buf[i];
+    if (ch == '\r')
+      continue;
+    if (ch == '\n')
+    {
+      line_accum[line_len] = 0;
+      if (line_len > 0 && !uart_flag) // 플래그 중복 방지
+      {
+        if (line_len < CMD_BUF_LEN) // overflow 방지
+        {
+          memcpy(uart_buf, line_accum, line_len);
+          uart_buf[line_len] = 0;
+          uart_flag = 1; // 수신 완료 플래그
         }
+      }
+      line_len = 0;
     }
+    else if (line_len < CMD_BUF_LEN - 1)
+    {
+      line_accum[line_len++] = (char)ch;
+    }
+    else
+    {
+      line_len = 0; // overflow시 리셋
+    }
+  }
+  last_uart_tick = tick_1ms;
+  timeout_reset_flag = 0;
 
-    // 연속 수신 재가동
-    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, rx_dma_buf, RX_BUF_LEN);
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart2, rx_dma_buf, RX_BUF_LEN);
 }
-
 
 void set_servo_degree(int degree)
 {
@@ -423,7 +463,7 @@ void set_servo_degree(int degree)
     degree = 0;
   if (degree > 90)
     degree = 90;
-  uint16_t pulse = 500 + ((uint16_t)degree * 2000) / 180; // 0.5~2.5ms
+  uint16_t pulse = 500 + ((uint16_t)degree * 2000) / 180;
   __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pulse);
   current_servo_degree = degree;
 }
@@ -465,25 +505,35 @@ void parsing_command(char *recvBuf)
   }
 
   if (i < 2 || !pArray[0] || !pArray[1])
-  {
     return;
-  }
 
   char area = pArray[0][0];
   int level = 1;
 
   if (strlen(pArray[1]) == 1 && pArray[1][0] >= '1' && pArray[1][0] <= '3')
-  {
     level = pArray[1][0] - '0';
-  }
   else
-  {
     return;
+
+  int move_deg = 1;
+  switch (level)
+  {
+  case 1:
+    move_deg = LEVEL_1_DEGREE;
+    break;
+  case 2:
+    move_deg = LEVEL_2_DEGREE;
+    break;
+  case 3:
+    move_deg = LEVEL_3_DEGREE;
+    break;
+  case 4:
+    move_deg = LEVEL_4_DEGREE;
+    break;
+  case 5:
+    move_deg = LEVEL_5_DEGREE;
+    break;
   }
-
-  int move_deg = (level == 1) ? LEVEL_1_DEGREE : (level == 2) ? LEVEL_2_DEGREE
-                                                              : LEVEL_3_DEGREE;
-
   control_pantilt(area, move_deg);
 }
 
@@ -491,33 +541,33 @@ void control_pantilt(char area, int move_deg)
 {
   switch (area)
   {
-  case 'Q':
+  case 'E':
     set_servo_degree((current_servo_degree + move_deg > 180) ? 180 : current_servo_degree + move_deg);
     set_servo2_degree((current_servo2_degree >= move_deg) ? current_servo2_degree - move_deg : 0);
     break;
   case 'W':
     set_servo_degree((current_servo_degree + move_deg > 180) ? 180 : current_servo_degree + move_deg);
     break;
-  case 'E':
+  case 'Q':
     set_servo_degree((current_servo_degree + move_deg > 180) ? 180 : current_servo_degree + move_deg);
     set_servo2_degree((current_servo2_degree + move_deg > 180) ? 180 : current_servo2_degree + move_deg);
     break;
-  case 'A':
+  case 'D':
     set_servo2_degree((current_servo2_degree >= move_deg) ? current_servo2_degree - move_deg : 0);
     break;
   case 'S':
     break;
-  case 'D':
+  case 'A':
     set_servo2_degree((current_servo2_degree + move_deg > 180) ? 180 : current_servo2_degree + move_deg);
     break;
-  case 'Z':
+  case 'C':
     set_servo_degree((current_servo_degree >= move_deg) ? current_servo_degree - move_deg : 0);
     set_servo2_degree((current_servo2_degree >= move_deg) ? current_servo2_degree - move_deg : 0);
     break;
   case 'X':
     set_servo_degree((current_servo_degree >= move_deg) ? current_servo_degree - move_deg : 0);
     break;
-  case 'C':
+  case 'Z':
     set_servo_degree((current_servo_degree >= move_deg) ? current_servo_degree - move_deg : 0);
     set_servo2_degree((current_servo2_degree + move_deg > 180) ? 180 : current_servo2_degree + move_deg);
     break;
@@ -525,7 +575,6 @@ void control_pantilt(char area, int move_deg)
     break;
   }
 }
-
 /* USER CODE END 4 */
 
 /**
