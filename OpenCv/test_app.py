@@ -17,7 +17,8 @@ import pyrealsense2 as rs
 
 # ===== 설정 =====
 CONF_TH = 0.5
-MODEL_PATH = "/home/ydj9072/opencv/runs/detect/drone_detector_yolov8s_dataset36/weights/best.pt"      # ← YOLOv8s 가중치 파일
+#MODEL_PATH = "/home/ydj9072/opencv/runs/detect/drone_detector_yolov8s_dataset36/weights/best.pt"      # ← YOLOv8s 가중치 파일
+MODEL_PATH = "/home/ydj9072/opencv/best.pt"
 WIDTH, HEIGHT, FPS = 1280, 720, 30
 
 # RealSense 옵션
@@ -36,7 +37,7 @@ HOST, PORT = "0.0.0.0", 8000
 BUF_SIZE = 100
 NAME_SIZE = 20
 
-CHAT_HOST = "192.168.0.175"
+CHAT_HOST = "192.168.0.172"
 CHAT_PORT = 5000
 CHAT_NAME = "RASPBERRYPI"
 
@@ -48,6 +49,8 @@ latest_result   = None        # 선택 박스 중심의 3x3 그리드 문자
 latest_depth    = None        # 선택 박스 중심의 깊이(m)
 latest_is_drone = False       # 선택 박스가 'drone' 라벨인지
 latest_label    = None        # 선택된 타깃의 라벨명 (소켓 전송용)
+latest_cx       = None        # ★ 중심 X (pixel)
+latest_cy       = None        # ★ 중심 Y (pixel)
 
 result_cv = threading.Condition()
 stop_event = threading.Event()
@@ -71,22 +74,24 @@ def value_from_xy(x, y, w, h):
 # ===== 소켓 보조 =====
 def send_loop(sock: socket.socket, stop_event: threading.Event, name: str, interval: float = sec) -> None:
     """
-    latest_result가 있을 때만 서버로 전송.
-    포맷: "<그리드문자>@<1|2>@<라벨명>\n"
-          - 1: depth 없음/0, 2: depth 있음
+    latest_* 값으로 서버 전송.
+    포맷: "<cx>@<cy>@<depth>@<label>\\n"
+    - depth가 유효하지 않으면 0.000으로 보냄
+    - label이 없으면 빈 문자열
     """
-    print("Send loop: only on latest_result changes")
+    print("Send loop: sending cx@cy@depth@label")
     next_ts = time.monotonic()
 
     try:
         while not stop_event.is_set():
-            cur    = latest_result
-            depth  = latest_depth
-            label  = latest_label or ""
+            cx    = latest_cx
+            cy    = latest_cy
+            depth = latest_depth
+            label = latest_label or ""
 
-            if cur is not None:
-                tag = "1" if (depth in (None, 0)) else "2"
-                payload  = f"{str(cur)}@{tag}@{label}\n"
+            if (cx is not None) and (cy is not None):
+                z = depth if (depth is not None and depth > 0.0 and not (isinstance(depth, float) and np.isnan(depth))) else 0.0
+                payload  = f"{int(cx)}@{int(cy)}@{z:.3f}@{label}\n"
 
                 name_msg = payload if payload.startswith('[') else f"[QTCLIENT]{payload}"
                 try:
@@ -164,7 +169,7 @@ def depth_to_bgr(z):
 
 # ===== 추론 스레드 (★ YOLOv8s CUDA 기반) =====
 def inference_thread():
-    global latest_frame, latest_result, latest_depth, latest_is_drone, latest_label
+    global latest_frame, latest_result, latest_depth, latest_is_drone, latest_label, latest_cx, latest_cy
 
     # ----- RealSense 파이프라인 설정 -----
     pipeline = rs.pipeline()
@@ -249,21 +254,16 @@ def inference_thread():
                         z = float(depth_frame.get_distance(bx_c, by_c))  # meters
 
                     has_z = _valid_depth(z)
-                    # 정렬 키: (우선: 깊이 유효한가 True>False) → (깊이값 오름차순) → (conf 내림차순) → (area 내림차순)
-                    # 파이썬 max를 쓰려면 반대로 뒤집는데, 우리는 "가장 가까운"을 원하므로 min을 사용.
                     cand.append( (has_z, z if has_z else float('inf'), -c, -area, lbl, x1, y1, x2, y2, bx, by) )
 
             # ---- ★ 깊이 최우선 선택 로직 ★ ----
-            # 설명: cand에서 (has_z True, z 작은 것)이 가장 먼저 오도록 구성했으므로, min()으로 선택.
             best = None
             if cand:
                 has_any_valid_depth = any(item[0] for item in cand)
                 if has_any_valid_depth:
-                    # 깊이 유효한 후보들만 추려서 z 최소인 것 선택 (동률 시 conf, area로 타이브레이크)
                     subset = [it for it in cand if it[0]]
                     best = min(subset, key=lambda t: (t[1], t[2], t[3]))
                 else:
-                    # 깊이 미측정(0/NaN)만 있을 땐 conf→area 기준으로 선택
                     best = min(cand, key=lambda t: (t[2], t[3]))
 
             # ---- 오버레이 & 상태 갱신 ----
@@ -289,12 +289,16 @@ def inference_thread():
                 latest_label    = lbl
                 with frame_lock:
                     latest_depth = float(z) if _valid_depth(z) else 0.0
+                    latest_cx    = int(bx)   # ★ 중심 X
+                    latest_cy    = int(by)   # ★ 중심 Y
             else:
                 latest_result   = None
                 latest_is_drone = False
                 latest_label    = None
                 with frame_lock:
                     latest_depth = None
+                    latest_cx    = None
+                    latest_cy    = None
 
             # ---- 공유 프레임 업데이트 ----
             with frame_lock:
@@ -341,6 +345,33 @@ def stream():
 def flask_thread():
     app.run(host=HOST, port=PORT, threaded=True, use_reloader=False)
 
+def depth_to_tag(z: float) -> str:
+    """
+    요청 매핑:
+      - 0.0 ~ 0.5      -> '1'
+      - 0.8 ~ 1.1      -> '1'  (1이 두 구간을 커버)
+      - (1.1 ~ 1.4)    -> '2'  (1.1 초과 ~ 1.4 미만)
+      - [1.4 ~ 1.7)    -> '3'
+      - [2.0 ~ 2.3]    -> '4'
+      - > 2.3          -> '5'
+      - 그 외/미측정   -> '0'
+    """
+    if not _valid_depth(z):
+        return "0"
+    if 0.0 <= z <= 0.5:
+        return "1"
+    # 2~5번 구간
+    if 0.5 < z < 1.3:
+        return "2"
+    if 1.3 <= z < 1.6:
+        return "3"
+    if 1.6 <= z <= 1.9:
+        return "4"
+    if z > 1.9:
+        return "5"
+    # 명시되지 않은 빈 구간은 0
+    return "0"
+
 # ===== UART 스레드 =====
 def uart_thread(interval=None):
     ser = None
@@ -352,7 +383,6 @@ def uart_thread(interval=None):
                 ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=SERIAL_TIMEOUT)
                 print(f"[UART] Opened {SERIAL_PORT} @ {BAUDRATE}")
             except Exception as e:
-                #print(f"[UART] Open failed: {e}; retry in 1s")
                 time.sleep(1.0)
                 continue
 
@@ -360,7 +390,7 @@ def uart_thread(interval=None):
         depth = latest_depth
 
         if cur is not None:
-            tag = "1" if (depth in (None, 0)) else "2"
+            tag = depth_to_tag(depth)
             payload = f"{str(cur)}@{tag}\n"
             try:
                 ser.write(payload.encode("ascii"))
@@ -435,4 +465,3 @@ if __name__ == "__main__":
         th_inf.join(timeout=2.0)
         th_uart.join(timeout=2.0)
         print("[MAIN] Done.")
-
