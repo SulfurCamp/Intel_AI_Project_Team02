@@ -1,0 +1,14 @@
+../Core/Src/main.c:101:5:main	2
+../Core/Src/main.c:160:6:SystemClock_Config	3
+../Core/Src/main.c:207:13:MX_TIM2_Init	5
+../Core/Src/main.c:260:13:MX_TIM3_Init	4
+../Core/Src/main.c:308:13:MX_USART2_UART_Init	2
+../Core/Src/main.c:341:13:MX_GPIO_Init	1
+../Core/Src/main.c:386:6:HAL_TIM_PeriodElapsedCallback	3
+../Core/Src/main.c:396:6:set_servo_degree	3
+../Core/Src/main.c:405:6:set_servo2_degree	3
+../Core/Src/main.c:416:6:HAL_UART_RxCpltCallback	4
+../Core/Src/main.c:430:6:parsing_command	15
+../Core/Src/main.c:479:6:control_pantilt	15
+../Core/Src/main.c:524:1:__io_putchar	1
+../Core/Src/main.c:538:6:Error_Handler	1
