@@ -17,7 +17,9 @@ import pyrealsense2 as rs
 
 # ===== 설정 =====
 CONF_TH = 0.5
-MODEL_PATH = "/home/ydj9072/opencv/runs/detect/drone_detector_yolov8s_dataset35/weights/best.pt"      # ← YOLOv8s 가중치 파일
+#MODEL_PATH = "/home/ydj9072/opencv/runs/detect/drone_detector_yolov8s_dataset36/weights/best.pt"      # ← YOLOv8s 가중치 파일
+#MODEL_PATH = "/home/ydj9072/opencv/best.pt"
+MODEL_PATH = "/home/ydj9072/best.pt"
 WIDTH, HEIGHT, FPS = 1280, 720, 30
 
 # RealSense 옵션
@@ -36,7 +38,7 @@ HOST, PORT = "0.0.0.0", 8000
 BUF_SIZE = 100
 NAME_SIZE = 20
 
-CHAT_HOST = "192.168.0.47"
+CHAT_HOST = "192.168.0.172"
 CHAT_PORT = 5000
 CHAT_NAME = "RASPBERRYPI"
 
@@ -48,11 +50,13 @@ latest_result   = None        # 선택 박스 중심의 3x3 그리드 문자
 latest_depth    = None        # 선택 박스 중심의 깊이(m)
 latest_is_drone = False       # 선택 박스가 'drone' 라벨인지
 latest_label    = None        # 선택된 타깃의 라벨명 (소켓 전송용)
+latest_cx       = None        # ★ 중심 X (pixel)
+latest_cy       = None        # ★ 중심 Y (pixel)
 
 result_cv = threading.Condition()
 stop_event = threading.Event()
 
-sec = 1.0
+sec = 0.2
 R = "R"  # 검출 없을 때 UART로 보낼 대체 문자
 
 # ===== 3x3 키맵 & 좌표→문자 =====
@@ -71,22 +75,24 @@ def value_from_xy(x, y, w, h):
 # ===== 소켓 보조 =====
 def send_loop(sock: socket.socket, stop_event: threading.Event, name: str, interval: float = sec) -> None:
     """
-    latest_result가 있을 때만 서버로 전송.
-    포맷: "<그리드문자>@<1|2>@<라벨명>\n"
-          - 1: depth 없음/0, 2: depth 있음
+    latest_* 값으로 서버 전송.
+    포맷: "<cx>@<cy>@<depth>@<label>\\n"
+    - depth가 유효하지 않으면 0.000으로 보냄
+    - label이 없으면 빈 문자열
     """
-    print("Send loop: only on latest_result changes")
+    print("Send loop: sending cx@cy@depth@label")
     next_ts = time.monotonic()
 
     try:
         while not stop_event.is_set():
-            cur    = latest_result
-            depth  = latest_depth
-            label  = latest_label or ""
+            cx    = latest_cx
+            cy    = latest_cy
+            depth = latest_depth
+            label = latest_label or ""
 
-            if cur is not None:
-                tag = "1" if (depth in (None, 0)) else "2"
-                payload  = f"{str(cur)}@{tag}@{label}\n"
+            if (cx is not None) and (cy is not None):
+                z = depth if (depth is not None and depth > 0.0 and not (isinstance(depth, float) and np.isnan(depth))) else 0.0
+                payload  = f"{int(cx)}@{int(cy)}@{z:.3f}@{label}\n"
 
                 name_msg = payload if payload.startswith('[') else f"[QTCLIENT]{payload}"
                 try:
@@ -140,9 +146,31 @@ def recv_loop(sock: socket.socket, stop_event: threading.Event) -> None:
         except OSError:
             pass
 
+# ===== 유틸: 안전한 깊이값 비교용 =====
+def _valid_depth(z):
+    # RealSense에서 미측정은 0.0인 경우가 많음. NaN도 배제.
+    return (z is not None) and (z > 0.0) and (not np.isnan(z))
+
+def depth_to_bgr(z):
+    """
+    규칙:
+      - z가 None, NaN, <= 0.0 이면 빨강 (미측정/0)
+      - 0.5 ~ 1.0 이면 초록
+      - 1.0 이상이면 파랑
+      - 0 < z < 0.5 은 명시 없어서 빨강 처리
+    반환: (B, G, R)
+    """
+    if (z is None) or (not isinstance(z, (int, float))) or np.isnan(z) or z <= 0.0:
+        return (0, 0, 255)      # 빨강
+    if 0.5 <= z <= 1.0:
+        return (0, 255, 0)      # 초록
+    if z >= 1.0:
+        return (255, 0, 0)      # 파랑
+    return (0, 0, 255)          # 0 < z < 0.5 → 빨강
+
 # ===== 추론 스레드 (★ YOLOv8s CUDA 기반) =====
 def inference_thread():
-    global latest_frame, latest_result, latest_depth, latest_is_drone, latest_label
+    global latest_frame, latest_result, latest_depth, latest_is_drone, latest_label, latest_cx, latest_cy
 
     # ----- RealSense 파이프라인 설정 -----
     pipeline = rs.pipeline()
@@ -167,7 +195,6 @@ def inference_thread():
     try:
         model.to(device_str)
     except Exception:
-        # 일부 환경에선 .to() 없이 device 인자로만 지정해도 동작
         pass
 
     names = model.names  # 클래스 id → 라벨명 매핑
@@ -188,15 +215,14 @@ def inference_thread():
             h, w = frame.shape[:2]
 
             # ---- YOLOv8s 추론 ----
-            # NOTE: conf=CONF_TH 로 1차 필터 (NMS 내부에서 적용)
-            #       device=device_str 로 CUDA 사용 (가능 시)
             try:
                 result = model(frame, conf=CONF_TH, verbose=False, device=device_str)[0]
             except Exception as e:
                 print(f"[INF] YOLO inference error: {e}")
                 result = None
 
-            # ---- 결과 파싱 → (area, conf, label, x1,y1,x2,y2) 리스트 ----
+            # ---- 결과 파싱 + 중심 깊이采樣 (depth가 가장 가까운 박스를 고름) ----
+            # cand 항목: (has_valid_depth, depth, conf, area, lbl, x1,y1,x2,y2, bx,by)
             cand = []
             if result is not None and result.boxes is not None and len(result.boxes) > 0:
                 boxes = result.boxes
@@ -220,47 +246,60 @@ def inference_thread():
                         continue
 
                     area = (x2 - x1) * (y2 - y1)
-                    cand.append((area, c, lbl, x1, y1, x2, y2))
+                    bx, by = (x1 + x2)//2, (y1 + y2)//2
 
-            # ---- ★ 면적 최대 박스 1개 선택 (동률 시 conf 큰 것) ★ ----
-            best = max(cand, key=lambda t: (t[0], t[1])) if cand else None
+                    z = None
+                    if depth_frame is not None:
+                        bx_c = int(max(0, min(w-1, bx)))
+                        by_c = int(max(0, min(h-1, by)))
+                        z = float(depth_frame.get_distance(bx_c, by_c))  # meters
 
-            # ---- 오버레이: 선택 박스만 그린다 ----
+                    has_z = _valid_depth(z)
+                    cand.append( (has_z, z if has_z else float('inf'), -c, -area, lbl, x1, y1, x2, y2, bx, by) )
+
+            # ---- ★ 깊이 최우선 선택 로직 ★ ----
+            best = None
+            if cand:
+                has_any_valid_depth = any(item[0] for item in cand)
+                if has_any_valid_depth:
+                    subset = [it for it in cand if it[0]]
+                    best = min(subset, key=lambda t: (t[1], t[2], t[3]))
+                else:
+                    best = min(cand, key=lambda t: (t[2], t[3]))
+
+            # ---- 오버레이 & 상태 갱신 ----
             vis = frame.copy()
             if best:
-                area, acc, lbl, x1, y1, x2, y2 = best
+                has_z, z, nconf, narea, lbl, x1, y1, x2, y2, bx, by = best
+                conf = -nconf
+                area = -narea
                 is_drone = (lbl.lower() == "drone")
-                color = (0, 255, 0) if is_drone else (255, 0, 0)  # drone=초록, 기타=파랑
+                color = depth_to_bgr(z if _valid_depth(z) else 0.0)
+
                 cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+                depth_text = f"Z={z:.3f}m" if _valid_depth(z) else "Z=?"
                 cv2.putText(
-                    vis, f"{lbl} {acc:.2f} {area}",
+                    vis, f"{lbl} {conf:.2f} {depth_text}",
                     (x1, max(0, y1 - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2
                 )
-
-                # ---- 결과/깊이 갱신 (선택 박스 기준) ----
-                bx, by = (x1 + x2)//2, (y1 + y2)//2
                 cv2.circle(vis, (bx, by), 5, (0, 255, 255), -1)
 
                 latest_result   = value_from_xy(bx, by, w, h) or "?"
                 latest_is_drone = is_drone
                 latest_label    = lbl
-
-                if depth_frame is not None:
-                    bx_c = int(max(0, min(w-1, bx)))
-                    by_c = int(max(0, min(h-1, by)))
-                    depth_val = depth_frame.get_distance(bx_c, by_c)  # meters
-                    with frame_lock:
-                        latest_depth = float(depth_val)
-                else:
-                    with frame_lock:
-                        latest_depth = None
+                with frame_lock:
+                    latest_depth = float(z) if _valid_depth(z) else 0.0
+                    latest_cx    = int(bx)   # ★ 중심 X
+                    latest_cy    = int(by)   # ★ 중심 Y
             else:
                 latest_result   = None
                 latest_is_drone = False
                 latest_label    = None
                 with frame_lock:
                     latest_depth = None
+                    latest_cx    = None
+                    latest_cy    = None
 
             # ---- 공유 프레임 업데이트 ----
             with frame_lock:
@@ -307,6 +346,33 @@ def stream():
 def flask_thread():
     app.run(host=HOST, port=PORT, threaded=True, use_reloader=False)
 
+def depth_to_tag(z: float) -> str:
+    """
+    요청 매핑:
+      - 0.0 ~ 0.5      -> '1'
+      - 0.8 ~ 1.1      -> '1'  (1이 두 구간을 커버)
+      - (1.1 ~ 1.4)    -> '2'  (1.1 초과 ~ 1.4 미만)
+      - [1.4 ~ 1.7)    -> '3'
+      - [2.0 ~ 2.3]    -> '4'
+      - > 2.3          -> '5'
+      - 그 외/미측정   -> '0'
+    """
+    if not _valid_depth(z):
+        return "0"
+    if 0.0 <= z <= 0.5:
+        return "1"
+    # 2~5번 구간
+    if 0.5 < z < 1.3:
+        return "2"
+    if 1.3 <= z < 1.6:
+        return "3"
+    if 1.6 <= z <= 1.9:
+        return "4"
+    if z > 1.9:
+        return "5"
+    # 명시되지 않은 빈 구간은 0
+    return "0"
+
 # ===== UART 스레드 =====
 def uart_thread(interval=None):
     ser = None
@@ -318,7 +384,6 @@ def uart_thread(interval=None):
                 ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=SERIAL_TIMEOUT)
                 print(f"[UART] Opened {SERIAL_PORT} @ {BAUDRATE}")
             except Exception as e:
-                print(f"[UART] Open failed: {e}; retry in 1s")
                 time.sleep(1.0)
                 continue
 
@@ -326,18 +391,16 @@ def uart_thread(interval=None):
         depth = latest_depth
 
         if cur is not None:
-            tag = "1" if (depth in (None, 0)) else "2"
+            tag = depth_to_tag(depth)
             payload = f"{str(cur)}@{tag}\n"
-        else:
-            payload = f"{R}\n"  # 검출 없을 때 메시지
-
-        try:
-            ser.write(payload.encode("ascii"))
-        except Exception as e:
-            print(f"[UART] Write failed: {e}; reopening...")
-            try: ser.close()
-            except: pass
-            ser = None
+            try:
+                ser.write(payload.encode("ascii"))
+                print(payload)
+            except Exception as e:
+                print(f"[UART] Write failed: {e}; reopening...")
+                try: ser.close()
+                except: pass
+                ser = None
 
         time.sleep(period)
 
@@ -403,4 +466,3 @@ if __name__ == "__main__":
         th_inf.join(timeout=2.0)
         th_uart.join(timeout=2.0)
         print("[MAIN] Done.")
-

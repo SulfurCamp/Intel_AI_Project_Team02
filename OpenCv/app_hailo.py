@@ -1,4 +1,3 @@
-#app_three_threads.py
 import sys
 import socket
 import time
@@ -7,21 +6,22 @@ import cv2
 import serial
 from dataclasses import dataclass, asdict
 from flask import Flask, Response, render_template_string
-from ultralytics import YOLO
+import onnxruntime as ort              # ← onnxruntime는 ort 별칭 (example() 내부에서 쓸 수 있음)
+from object_detection import example
 
 # ===== 추가: RealSense =====
 import numpy as np
 import pyrealsense2 as rs  # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<< CHANGED
 
+CONF_TH = 0.5              # 필요시 조절
+ONNX_MODEL_PATH = "best.onnx"  # 필요 시 사용
+
 # ===== 설정 =====
-# CAM_INDEX   = 0  # 웹캠용이었음 → 불필요
 WIDTH, HEIGHT, FPS = 1280, 720, 30
-MODEL_PATH  = "yolov8n.pt"   # 필요 시 바꿔도 됨
-WANT_CLASS  = None           # COCO 사람만: 0, 전체: None
 
 # RealSense 옵션 (필요시 조절)
-RS_USE_DEPTH   = False       # True 로 바꾸면 깊이 스트림도 켭니다
-RS_ALIGN_DEPTH = False       # True 로 바꾸면 컬러에 깊이를 정렬합니다
+RS_USE_DEPTH   = True        # 깊이 스트림 켭니다
+RS_ALIGN_DEPTH = True        # 컬러 기준으로 깊이 정렬합니다
 RS_SERIAL      = None        # 특정 장치 지정 시 시리얼 문자열
 
 SERIAL_PORT = "/dev/ttyACM0"
@@ -33,22 +33,21 @@ HOST, PORT = "0.0.0.0", 8000
 
 BUF_SIZE = 100
 NAME_SIZE = 20
-ARR_CNT = 5  # 프로토콜 유지용. (파싱 예비)
 
 CHAT_HOST = "192.168.0.47"
 #CHAT_HOST = "127.0.0.1"
 CHAT_PORT = 5000
 CHAT_NAME = "RASPBERRYPI"
 
-RS_USE_DEPTH   = True        # 깊이 스트림 켭니다
-RS_ALIGN_DEPTH = True        # 컬러 기준으로 깊이 정렬
-
 # ===== 공유 상태 =====
 latest_frame = None
 frame_lock   = threading.Lock()
 
-latest_result = None
-latest_depth = None
+latest_result   = None        # 선택 박스 중심의 3x3 그리드 문자
+latest_depth    = None        # 선택 박스 중심의 깊이(m)
+latest_is_drone = False       # 선택 박스가 'drone' 라벨인지
+latest_label    = None        # 선택된 타깃의 라벨명 (소켓 전송용)
+
 result_cv = threading.Condition()  # 새 결과 알림
 stop_event = threading.Event()
 
@@ -68,67 +67,26 @@ def value_from_xy(x, y, w, h):
     row = min(2, int(3 * y / h))
     return KEYMAP[row][col]
 
-# ===== 유틸(그리기) =====
-def draw_grid(frame):
-    h, w = frame.shape[:2]
-    w3, h3 = w // 3, h // 3
-    color = (0, 255, 255)
-    t = 1
-    cv2.line(frame, (w3, 0), (w3, h), color, t, cv2.LINE_AA)
-    cv2.line(frame, (2*w3, 0), (2*w3, h), color, t, cv2.LINE_AA)
-    cv2.line(frame, (0, h3), (w, h3), color, t, cv2.LINE_AA)
-    cv2.line(frame, (0, 2*h3), (w, 2*h3), color, t, cv2.LINE_AA)
-    # 번호
-    for r in range(3):
-        for c in range(3):
-            cx = int((c + 0.5) * w3)
-            cy = int((r + 0.5) * h3)
-            idx = r * 3 + c + 1
-            cv2.putText(frame, str(idx), (cx - 10, cy + 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 2, cv2.LINE_AA)
-            
-def draw_cross(frame):
-    h, w = frame.shape[:2]
-    cx, cy = w // 2, h // 2
-    cv2.drawMarker(frame, (cx, cy), (255, 0, 0),
-                   markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2, line_type=cv2.LINE_AA)
-
-# ===== 추론 스레드 =====
-def select_target(result, want_cls=None):
-    if result.boxes is None or len(result.boxes) == 0:
-        return None
-    xyxy = result.boxes.xyxy.cpu().numpy()
-    cls  = result.boxes.cls.cpu().numpy() if result.boxes.cls is not None else None
-    best_i, best_area = -1, -1.0
-    for i, (x1,y1,x2,y2) in enumerate(xyxy):
-        if want_cls is not None and cls is not None and int(cls[i]) != int(want_cls):
-            continue
-        area = max(0.0, x2-x1) * max(0.0, y2-y1)
-        if area > best_area:
-            best_area, best_i = area, i
-    if best_i < 0: return None
-    return tuple(map(float, xyxy[best_i]))
-
+# ===== 소켓 보조 =====
 def send_loop(sock: socket.socket, stop_event: threading.Event, name: str, interval: float = sec) -> None:
     """
-    latest_result가 변경될 때만 서버로 전송.
-    메시지가 '[' 로 시작하지 않으면 [ALLMSG] prefix를 붙여 보냄.
+    latest_result가 있을 때만 서버로 전송.
+    포맷: "<그리드문자>@<1|2>@<라벨명>\n"
+          - 1: depth 없음/0, 2: depth 있음
     """
     print("Send loop: only on latest_result changes")
     next_ts = time.monotonic()
 
     try:
         while not stop_event.is_set():
-            # 최신 값 스냅샷
-            cur   = latest_result
-            depth = latest_depth
+            cur    = latest_result
+            depth  = latest_depth
+            label  = latest_label or ""
 
-            if cur is not None:  # 값이 있을 때만 보냄(원하면 이 조건을 제거해 항상 전송)
-                if depth == 0 :
-                    payload  = f"{str(cur)}@1\n"
-                else :
-                    payload  = f"{str(cur)}@2\n"
-                
+            if cur is not None:
+                tag = "1" if (depth in (None, 0)) else "2"
+                payload  = f"{str(cur)}@{tag}@{label}\n"
+
                 name_msg = payload if payload.startswith('[') else f"[QTCLIENT]{payload}"
                 try:
                     sock.sendall(name_msg.encode("utf-8"))
@@ -136,7 +94,6 @@ def send_loop(sock: socket.socket, stop_event: threading.Event, name: str, inter
                     stop_event.set()
                     break
 
-            # 정확한 주기 유지(드리프트 방지)
             next_ts += interval
             sleep_for = max(0.0, next_ts - time.monotonic())
             if stop_event.wait(sleep_for):
@@ -152,10 +109,6 @@ def send_loop(sock: socket.socket, stop_event: threading.Event, name: str, inter
             pass
 
 def recv_loop(sock: socket.socket, stop_event: threading.Event) -> None:
-    """
-    서버로부터의 수신 데이터를 그대로 표준출력에 씀.
-    서버가 연결을 닫으면 stop_event를 set하고 종료.
-    """
     try:
         while not stop_event.is_set():
             try:
@@ -186,8 +139,9 @@ def recv_loop(sock: socket.socket, stop_event: threading.Event) -> None:
         except OSError:
             pass
 
+# ===== 추론 스레드 =====
 def inference_thread():
-    global latest_frame, latest_result, latest_depth
+    global latest_frame, latest_result, latest_depth, latest_is_drone, latest_label
 
     pipeline = rs.pipeline()
     config   = rs.config()
@@ -199,14 +153,7 @@ def inference_thread():
         config.enable_stream(rs.stream.depth, WIDTH, HEIGHT, rs.format.z16, FPS)
 
     profile = pipeline.start(config)
-
     align = rs.align(rs.stream.color) if (RS_USE_DEPTH and RS_ALIGN_DEPTH) else None
-    depth_scale = None
-    if RS_USE_DEPTH:
-        depth_sensor = profile.get_device().first_depth_sensor()
-        depth_scale = depth_sensor.get_depth_scale()
-
-    model = YOLO(MODEL_PATH)
 
     try:
         while not stop_event.is_set():
@@ -222,58 +169,98 @@ def inference_thread():
 
             frame = np.asanyarray(color_frame.get_data())
             h, w = frame.shape[:2]
-            cx, cy = w // 2, h // 2
 
-            # --- YOLO ---
-            target_bbox = None
-            for r in model(frame, stream=True):
-                target_bbox = select_target(r, WANT_CLASS)
-                if target_bbox is not None:
-                    break
+            # ---- example() 기반 추론 ----
+            try:
+                raw_dets = example(frame)  # list[dict]: object_label/start/end/accuracy
+                print(raw_dets)  # 디버그 필요 시
+            except Exception as e:
+                print(f"[INF] example() error: {e}")
+                raw_dets = []
 
-            # ---- 화면용 오버레이 ----
-            tmp = frame.copy()
-            draw_grid(tmp)
-            draw_cross(tmp)
-            with frame_lock:
-                latest_frame = tmp
+            # ---- 신뢰도 필터링 & 경계 보정 ----
+            cand = []
+            for d in raw_dets:
+                acc = float(d.get("accuracy", 0.0))
+                if acc < CONF_TH:
+                    continue
 
-            # ---- 좌표 결정 (디텍션 없으면 화면 중앙) ----
-            if target_bbox is not None:
-                x1, y1, x2, y2 = map(int, target_bbox)
+                lbl = str(d.get("object_label", ""))
+
+                s = d.get("start", {}); e = d.get("end", {})
+                x1, y1 = int(s.get("x", 0)), int(s.get("y", 0))
+                x2, y2 = int(e.get("x", 0)), int(e.get("y", 0))
+
+                x1 = max(0, min(w-1, x1)); x2 = max(0, min(w-1, x2))
+                y1 = max(0, min(h-1, y1)); y2 = max(0, min(h-1, y2))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                area = (x2 - x1) * (y2 - y1)
+                # cand 항목: (area, acc, lbl, x1, y1, x2, y2)
+                cand.append((area, acc, lbl, x1, y1, x2, y2))
+
+            # ---- ★ 면적 최대 박스 1개 선택 (동률 시 acc 큰 것) ★ ----
+            best = max(cand, key=lambda t: (t[0], t[1])) if cand else None
+
+            # ---- 오버레이: 선택 박스만 그린다 ----
+            vis = frame.copy()
+            if best:
+                area, acc, lbl, x1, y1, x2, y2 = best
+                is_drone = (lbl.lower() == "drone")
+                color = (0, 255, 0) if is_drone else (255, 0, 0)  # drone=초록, 기타=파랑
+                cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(
+                    vis, f"{lbl} {acc:.2f} {area}",
+                    (x1, max(0, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2
+                )
+
+                # ---- 결과/깊이 갱신 (선택 박스 기준) ----
                 bx, by = (x1 + x2)//2, (y1 + y2)//2
-                latest_result = value_from_xy(bx, by, w, h) or "?"
-                cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
-                cv2.circle(frame, (bx,by), 5, (0,0,255), -1)
+                cv2.circle(vis, (bx, by), 5, (0, 255, 255), -1)
+
+                latest_result   = value_from_xy(bx, by, w, h) or "?"
+                latest_is_drone = is_drone
+                latest_label    = lbl
+
+                if depth_frame is not None:
+                    bx_c = int(max(0, min(w-1, bx)))
+                    by_c = int(max(0, min(h-1, by)))
+                    depth_val = depth_frame.get_distance(bx_c, by_c)  # meters
+                    with frame_lock:
+                        latest_depth = float(depth_val)
+                else:
+                    with frame_lock:
+                        latest_depth = None
             else:
-                bx, by = cx, cy  # 감지 없으면 중앙 픽셀
-                latest_result = None  # 또는 유지하고 싶으면 삭제
-
-            # ---- 깊이 읽기 ----
-            if depth_frame is not None:
-                # 좌표 클램프(경계 밖 접근 방지)
-                bx_clamped = int(max(0, min(w-1, bx)))
-                by_clamped = int(max(0, min(h-1, by)))
-                depth_val = depth_frame.get_distance(bx_clamped, by_clamped)  # 미터
+                latest_result   = None
+                latest_is_drone = False
+                latest_label    = None
                 with frame_lock:
-                    latest_depth = float(depth_val)  # 0.0일 수도 있음(유효치 없는 경우)
+                    latest_depth = None
 
+            # ---- 공유 프레임 업데이트 ----
             with frame_lock:
-                latest_frame = frame
+                latest_frame = vis
 
             with result_cv:
                 result_cv.notify_all()
+
     finally:
-        try: pipeline.stop()
-        except: pass
+        try:
+            pipeline.stop()
+        except Exception:
+            pass
         print("[INF] Inference thread exit")
+
 
 # ===== Flask(MJPEG) 스레드 =====
 app = Flask(__name__)
 
 INDEX_HTML = """
 <!doctype html>
-<title>Stream (YOLO + Grid + Cross)</title>
+<title>Stream</title>
 <style>body{font-family:system-ui;margin:20px}img{max-width:100%;height:auto;border-radius:8px}</style>
 <h3>RealSense Stream</h3>
 <img src="/stream.mjpg">
@@ -299,7 +286,6 @@ def stream():
     return Response(mjpeg_gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 def flask_thread():
-    # reloader 끄기(카메라 2번 열림 방지)
     app.run(host=HOST, port=PORT, threaded=True, use_reloader=False)
 
 # ===== UART 스레드 =====
@@ -318,15 +304,16 @@ def uart_thread(interval=None):
                 time.sleep(1.0)
                 continue
 
-        # 최신 값 스냅샷
-        cur   = latest_result
-        depth = latest_depth
+        # 최신 값 스냅샷 (라벨/드론 여부와 무관하게 선택 박스가 있으면 전송)
+        cur     = latest_result
+        depth   = latest_depth
 
         if cur is not None:
-            payload = f"{str(cur)}@1\n" if depth == 0 else f"{str(cur)}@2\n"
+            tag = "1" if (depth in (None, 0)) else "2"
+            payload = f"{str(cur)}@{tag}\n"
             try:
                 ser.write(payload.encode("ascii"))
-                print(f"[UART] Sent: {payload.strip()}")
+                # print(f"[UART] Sent: {payload.strip()}")
             except Exception as e:
                 print(f"[UART] Write failed: {e}; reopening...")
                 try: ser.close()
@@ -343,35 +330,31 @@ def uart_thread(interval=None):
     print("[UART] Thread exit")
 
 
-# ===== 소켓 클라이언트 스레드 (추가) =====
+# ===== 소켓 클라이언트 스레드 =====
 def socket_client_thread():
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     except OSError as e:
         print(f"socket() error: {e}", file=sys.stderr)
-        sys.exit(1)
+        return
 
     try:
         sock.connect((CHAT_HOST, CHAT_PORT))
     except OSError as e:
         print(f"connect() error: {e}", file=sys.stderr)
-        sys.exit(1)
+        return
 
-    # 접속 즉시 인증(또는 초기 메시지) 전송: "[<name>:PASSWD]"
+    # 접속 즉시 인증(또는 초기 메시지) 전송: "[{name}:PASSWD]"
     first_msg = f"[{CHAT_NAME}:PASSWD]".encode("utf-8")
     try:
         sock.sendall(first_msg)
     except OSError as e:
         print(f"send() error: {e}", file=sys.stderr)
-        sys.exit(1)
+        return
 
-    stop_event = threading.Event()
-
-    # 수신 스레드 시작
     t_recv = threading.Thread(target=recv_loop, args=(sock, stop_event), daemon=True)
     t_recv.start()
 
-    # 송신 스레드
     t_send = threading.Thread(target=send_loop, args=(sock, stop_event, CHAT_NAME), daemon=True)
     t_send.start()
 
@@ -381,6 +364,7 @@ def socket_client_thread():
         stop_event.set()
 
     t_recv.join(timeout=1.0)
+
 
 # ===== 실행 =====
 if __name__ == "__main__":
@@ -403,3 +387,4 @@ if __name__ == "__main__":
         th_inf.join(timeout=2.0)
         th_uart.join(timeout=2.0)
         print("[MAIN] Done.")
+
