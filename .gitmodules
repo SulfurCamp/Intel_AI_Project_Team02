@@ -4,3 +4,9 @@
 [submodule "yocto/yocto/yocto_socket_server"]
 	path = yocto/yocto/yocto_socket_server
 	url = https://github.com/jeong7231/yocto_socket_server.git
+[submodule "yocto/yocto_qt_client"]
+	path = yocto/yocto_qt_client
+	url = https://github.com/jeong7231/yocto_qt_client.git
+[submodule "yocto/yocto_socket_server"]
+	path = yocto/yocto_socket_server
+	url = https://github.com/jeong7231/yocto_socket_server.git
