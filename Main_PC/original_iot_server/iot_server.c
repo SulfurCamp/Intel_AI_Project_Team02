@@ -18,7 +18,7 @@
 
 #define BUF_SIZE 100
 #define MAX_CLNT 32
-#define ID_SIZE 10
+#define ID_SIZE 50
 #define ARR_CNT 5
 
 #define DEBUG
