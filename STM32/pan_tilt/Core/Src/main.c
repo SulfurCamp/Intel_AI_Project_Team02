@@ -510,7 +510,7 @@ void parsing_command(char *recvBuf)
   char area = pArray[0][0];
   int level = 1;
 
-  if (strlen(pArray[1]) == 1 && pArray[1][0] >= '1' && pArray[1][0] <= '3')
+  if (strlen(pArray[1]) == 1 && pArray[1][0] >= '1' && pArray[1][0] <= '5')
     level = pArray[1][0] - '0';
   else
     return;
