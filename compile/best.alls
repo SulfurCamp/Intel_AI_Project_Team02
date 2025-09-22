@@ -1,0 +1,10 @@
+normalization1 = normalization([0.0, 0.0, 0.0], [255.0, 255.0, 255.0])
+change_output_activation(conv42, linear)
+change_output_activation(conv53, linear)
+change_output_activation(conv63, linear)
+change_output_activation(conv41, linear)
+change_output_activation(conv52, linear)
+change_output_activation(conv62, linear)
+quantization_param([conv42, conv53, conv63], force_range_out=[0.0, 1.0])
+nms_postprocess("yolov8s_nms_config.json", meta_arch=yolov8, engine=cpu)
+
