@@ -1,0 +1,16 @@
+# configuration/hailo_config.yaml
+
+postprocessing:
+  device_pre_post_layers:
+    nms: true # NMS를 활성화합니다.
+
+network:
+  network_name: yolov8s_drone # 컴파일될 모델의 이름
+
+paths:
+  # ‼️ 중요: 훈련 후 생성될 onnx 파일 경로를 가리킵니다.
+  network_path:
+    - ../yolov8s_drone.onnx 
+  
+  # 위에서 다운로드한 .alls 파일의 경로를 가리킵니다.
+  alls_script: yolovs8.alls
