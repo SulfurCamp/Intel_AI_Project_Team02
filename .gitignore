@@ -1,0 +1,16 @@
+﻿__pycache__/
+*.pyc
+.venv/
+env/
+build/
+dist/
+*.o
+*.out
+*.log
+.vscode/
+.idea/
+*.user
+*.zip
+*.tar.gz
+*.mp4
+*.heif

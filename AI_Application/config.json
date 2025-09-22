@@ -1,0 +1,21 @@
+{
+  "model": {
+    "input_size": 320,
+    "preprocess_mode": "letterbox",
+    "force_single_class": true,
+
+    "min_box_area_ratio": 0.006,
+    "max_box_area_ratio": 0.60,
+    "drop_border_ratio": 0.06
+  },
+  "postprocess_params": {
+    "score_threshold": 0.20,
+    "nms_iou_thresh": 0.70,
+    "max_detections": 100,
+    "pre_nms_topk": 0
+  },
+  "visualization_params": {
+    "score_thres": 0.20,
+    "max_boxes_to_draw": 100
+  }
+}
